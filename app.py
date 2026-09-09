@@ -3,11 +3,18 @@ import sqlite3
 import secrets
 import asyncio
 import threading
+import traceback
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from datetime import datetime, timezone
 
 from flask import Flask, request, redirect, url_for, session, render_template_string, flash
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    psycopg2 = None
+    RealDictCursor = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
@@ -44,78 +51,184 @@ if not ADMIN_ID:
 # DATABASE
 # ============================================================
 db_lock = threading.RLock()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+
+class DBConnection:
+    """Small compatibility wrapper for SQLite/PostgreSQL."""
+    def __init__(self, conn, postgres=False):
+        self.conn = conn
+        self.postgres = postgres
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self.conn.rollback()
+        self.close()
+
+    def _sql(self, sql):
+        return sql.replace("?", "%s") if self.postgres else sql
+
+    def execute(self, sql, params=()):
+        if self.postgres:
+            cur = self.conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute(self._sql(sql), params)
+            return cur
+        return self.conn.execute(sql, params)
+
+    def executemany(self, sql, seq):
+        if self.postgres:
+            cur = self.conn.cursor(cursor_factory=RealDictCursor)
+            cur.executemany(self._sql(sql), seq)
+            return cur
+        return self.conn.executemany(sql, seq)
+
+    def executescript(self, script):
+        if self.postgres:
+            cur = self.conn.cursor()
+            for statement in script.split(";"):
+                statement = statement.strip()
+                if statement:
+                    cur.execute(statement)
+            return cur
+        return self.conn.executescript(script)
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def close(self):
+        self.conn.close()
 
 def db():
+    if DATABASE_URL:
+        if psycopg2 is None:
+            raise RuntimeError("psycopg2 is required when DATABASE_URL is set.")
+        conn = psycopg2.connect(DATABASE_URL)
+        return DBConnection(conn, postgres=True)
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return DBConnection(conn, postgres=False)
 
 def init_db():
     with db_lock, db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            first_name TEXT NOT NULL DEFAULT '',
-            username TEXT DEFAULT '',
-            balance REAL NOT NULL DEFAULT 0,
-            total_orders INTEGER NOT NULL DEFAULT 0,
-            referred_by INTEGER DEFAULT NULL,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL CHECK(category IN ('proxy','vpn')),
-            name TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            price REAL NOT NULL DEFAULT 0,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS stock (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            credential TEXT NOT NULL,
-            sold_to INTEGER DEFAULT NULL,
-            sold_at TEXT DEFAULT NULL,
-            FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            delivered TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(product_id) REFERENCES products(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS deposits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            method TEXT NOT NULL,
-            amount REAL NOT NULL,
-            trxid TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            reviewed_at TEXT DEFAULT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        """)
+        if DATABASE_URL:
+            c.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGINT PRIMARY KEY,
+                first_name TEXT NOT NULL DEFAULT '',
+                username TEXT DEFAULT '',
+                balance DOUBLE PRECISION NOT NULL DEFAULT 0,
+                total_orders INTEGER NOT NULL DEFAULT 0,
+                referred_by BIGINT DEFAULT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS products (
+                id SERIAL PRIMARY KEY,
+                category TEXT NOT NULL CHECK(category IN ('proxy','vpn')),
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                price DOUBLE PRECISION NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS stock (
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                credential TEXT NOT NULL,
+                sold_to BIGINT DEFAULT NULL,
+                sold_at TEXT DEFAULT NULL
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                product_id INTEGER NOT NULL REFERENCES products(id),
+                amount DOUBLE PRECISION NOT NULL,
+                delivered TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deposits (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                method TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                trxid TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT DEFAULT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """)
+        else:
+            c.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                first_name TEXT NOT NULL DEFAULT '',
+                username TEXT DEFAULT '',
+                balance REAL NOT NULL DEFAULT 0,
+                total_orders INTEGER NOT NULL DEFAULT 0,
+                referred_by INTEGER DEFAULT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL CHECK(category IN ('proxy','vpn')),
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                price REAL NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS stock (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                credential TEXT NOT NULL,
+                sold_to INTEGER DEFAULT NULL,
+                sold_at TEXT DEFAULT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                delivered TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            );
+            CREATE TABLE IF NOT EXISTS deposits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                amount REAL NOT NULL,
+                trxid TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT DEFAULT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """)
         for k, v in DEFAULT_SETTINGS.items():
-            c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+            if DATABASE_URL:
+                c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (k, v))
+            else:
+                c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
 
-        # Seed the four requested proxy products only if there are no products yet.
         count = c.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]
         if count == 0:
             now = utcnow()
@@ -413,11 +526,18 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         with db_lock, db() as c:
-            cur = c.execute(
-                "INSERT INTO deposits(user_id,method,amount,trxid,status,created_at) VALUES(?,?,?,?,?,?)",
-                (uid, method, float(amount), trxid, "pending", utcnow())
-            )
-            deposit_id = cur.lastrowid
+            if DATABASE_URL:
+                cur = c.execute(
+                    "INSERT INTO deposits(user_id,method,amount,trxid,status,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+                    (uid, method, float(amount), trxid, "pending", utcnow())
+                )
+                deposit_id = cur.fetchone()["id"]
+            else:
+                cur = c.execute(
+                    "INSERT INTO deposits(user_id,method,amount,trxid,status,created_at) VALUES(?,?,?,?,?,?)",
+                    (uid, method, float(amount), trxid, "pending", utcnow())
+                )
+                deposit_id = cur.lastrowid
             c.commit()
 
         await update.message.reply_text(
@@ -516,6 +636,8 @@ async def admin_deposit_callback(update: Update, context: ContextTypes.DEFAULT_T
 # ============================================================
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+BOT_APPLICATION = None
+BOT_LOOP = None
 
 BASE_CSS = """
 <style>
@@ -564,6 +686,7 @@ PANEL_HTML = BASE_CSS + """
 <a href="{{url_for('deposits')}}">💳 Deposits</a>
 <a href="{{url_for('users')}}">👥 Users</a>
 <a href="{{url_for('settings_page')}}">⚙️ Settings</a>
+<a href="{{url_for('broadcast')}}">📢 Broadcast</a>
 <a href="{{url_for('logout')}}">Logout</a>
 </nav>
 <div class="container">
@@ -833,6 +956,59 @@ def user_edit(uid):
     </form></div>"""
     return render_template_string(PANEL_HTML, body=body)
 
+@app.route("/admin/broadcast", methods=["GET","POST"])
+@admin_required
+def broadcast():
+    result = None
+    if request.method == "POST":
+        message = request.form.get("message", "").strip()
+        if not message:
+            flash("Message is empty.")
+            return redirect(url_for("broadcast"))
+        if not BOT_APPLICATION or not BOT_LOOP or not BOT_LOOP.is_running():
+            flash("Telegram bot is not running. Check Render logs.")
+            return redirect(url_for("broadcast"))
+
+        with db_lock, db() as c:
+            rows = c.execute("SELECT id FROM users ORDER BY id").fetchall()
+        user_ids = [int(r["id"]) for r in rows]
+
+        async def send_all():
+            sent = failed = blocked = 0
+            for uid in user_ids:
+                try:
+                    await BOT_APPLICATION.bot.send_message(chat_id=uid, text=message)
+                    sent += 1
+                    await asyncio.sleep(0.05)
+                except Exception as e:
+                    failed += 1
+                    s = str(e).lower()
+                    if "blocked" in s or "chat not found" in s or "user is deactivated" in s:
+                        blocked += 1
+            return sent, failed, blocked
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(send_all(), BOT_LOOP)
+            sent, failed, blocked = future.result(timeout=300)
+            result = f"Broadcast complete: {sent} sent, {failed} failed, {blocked} blocked/deactivated."
+            flash(result)
+        except Exception as e:
+            print("Broadcast error:", repr(e))
+            flash("Broadcast failed. Check Render logs.")
+        return redirect(url_for("broadcast"))
+
+    body = """
+    <h1>📢 Broadcast</h1>
+    <div class="card">
+      <p>Send a text message to all registered users.</p>
+      <form method="post">
+        <textarea name="message" rows="8" placeholder="Write your message here..." required></textarea><br><br>
+        <button class="success">📢 Send Broadcast</button>
+      </form>
+    </div>
+    """
+    return render_template_string(PANEL_HTML, body=body)
+
 @app.route("/admin/settings", methods=["GET","POST"])
 @admin_required
 def settings_page():
@@ -852,7 +1028,7 @@ def settings_page():
     <label>Bot Username (without @)</label><input name="bot_username" value="{vals['bot_username']}"><br><br>
     <button class="success">Save Settings</button>
     </form></div>
-    <div class="card"><b>Important:</b> Keep BOT_TOKEN and ADMIN_ID in Render Environment Variables, not inside the source code.</div>
+    <div class="card"><b>Important:</b> Keep BOT_TOKEN, ADMIN_ID, and DATABASE_URL in Render Environment Variables, not inside the source code.</div>
     """
     return render_template_string(PANEL_HTML, body=body)
 
@@ -860,30 +1036,67 @@ def settings_page():
 # STARTUP
 # ============================================================
 def run_bot():
+    global BOT_APPLICATION, BOT_LOOP
+
     async def runner():
-        application = Application.builder().token(BOT_TOKEN).build()
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CallbackQueryHandler(admin_deposit_callback, pattern=r"^admin(approve|reject):"))
-        application.add_handler(CallbackQueryHandler(menu_callback))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
-        print("Telegram bot started.")
+        global BOT_APPLICATION, BOT_LOOP
         try:
+            print("==> Starting Telegram bot...", flush=True)
+            if DATABASE_URL:
+                print("==> DATABASE_URL detected; using PostgreSQL.", flush=True)
+            else:
+                print("==> DATABASE_URL not set; using SQLite.", flush=True)
+
+            application = Application.builder().token(BOT_TOKEN).build()
+            application.add_handler(CommandHandler("start", start))
+            application.add_handler(CallbackQueryHandler(
+                admin_deposit_callback, pattern=r"^admin(approve|reject):"
+            ))
+            application.add_handler(CallbackQueryHandler(menu_callback))
+            application.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, text_message)
+            )
+
+            BOT_APPLICATION = application
+            BOT_LOOP = asyncio.get_running_loop()
+
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(drop_pending_updates=True)
+            print("==> Telegram bot started successfully. Polling is active.", flush=True)
+
             await asyncio.Event().wait()
+
+        except Exception as e:
+            print("!!! Telegram bot crashed:", repr(e), flush=True)
+            traceback.print_exc()
+            raise
         finally:
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
+            try:
+                if BOT_APPLICATION and BOT_APPLICATION.updater:
+                    await BOT_APPLICATION.updater.stop()
+                if BOT_APPLICATION:
+                    await BOT_APPLICATION.stop()
+                    await BOT_APPLICATION.shutdown()
+            except Exception as e:
+                print("Bot shutdown error:", repr(e), flush=True)
+            BOT_APPLICATION = None
+            BOT_LOOP = None
 
-    asyncio.run(runner())
-
-init_db()
+try:
+    init_db()
+    print("==> Database initialized successfully.", flush=True)
+except Exception as e:
+    print("!!! Database initialization failed:", repr(e), flush=True)
+    traceback.print_exc()
+    raise
 
 if __name__ == "__main__":
     # Render expects an HTTP server. Bot runs in a background thread.
     if BOT_TOKEN:
-        t = threading.Thread(target=run_bot, daemon=True)
+        t = threading.Thread(target=run_bot, daemon=True, name="telegram-bot")
         t.start()
+        print("==> Telegram bot thread started.", flush=True)
+    else:
+        print("!!! BOT_TOKEN is empty; Telegram bot will not start.", flush=True)
     app.run(host="0.0.0.0", port=PORT)
